@@ -1,0 +1,9 @@
+---
+# Deregister this edge host from Palette
+- name: Deregister Edge Host from Palette
+  hosts: edge_hosts
+  gather_facts: false
+  tasks:
+    - name: Run deregister tasks
+      ansible.builtin.include_tasks:
+        file: tasks/deregister_tasks.yml

@@ -1,0 +1,256 @@
+---
+# Register tasks - includable from site.yml or standalone register.yml
+- name: Gather facts for register
+  ansible.builtin.setup:
+
+- name: Set API vars for register
+  ansible.builtin.set_fact:
+    palette_api_base: "https://{{ palette_endpoint }}"
+    palette_auth_header:
+      ApiKey: "{{ palette_api_key }}"
+      Content-Type: "application/json"
+      Accept: "application/json"
+    registration_token_name: "ansible-reg-{{ ansible_hostname }}"
+    registration_token_expiry: "{{ '%Y-%m-%dT00:00:00Z' | strftime((ansible_date_time.epoch | int) + 86400 * 30) }}"
+
+- name: Get project UID
+  ansible.builtin.uri:
+    url: "{{ palette_api_base }}/v1/dashboard/projects/metadata?name={{ palette_project_name | urlencode }}"
+    method: GET
+    headers: "{{ palette_auth_header }}"
+    return_content: true
+    status_code: [200]
+  register: project_lookup
+  retries: 3
+  delay: 2
+  until: project_lookup.status == 200
+
+- name: Set project UID fact
+  ansible.builtin.set_fact:
+    palette_project_uid: "{{ project_lookup.json['items'][0].metadata.uid }}"
+
+- name: Display project UID
+  ansible.builtin.debug:
+    msg: "Project UID: {{ palette_project_uid }}"
+
+# --- Create registration token (tenant-scoped, no ProjectUid header) ---
+- name: Create registration token
+  ansible.builtin.uri:
+    url: "{{ palette_api_base }}/v1/edgehosts/tokens"
+    method: POST
+    headers: "{{ palette_auth_header }}"
+    body_format: json
+    body:
+      metadata:
+        name: "{{ registration_token_name }}-{{ ansible_date_time.epoch }}"
+      spec:
+        defaultProjectUid: "{{ palette_project_uid }}"
+        expiry: "{{ registration_token_expiry }}"
+    return_content: true
+    status_code: [200, 201]
+  register: new_token_result
+  retries: 5
+  delay: 3
+  until: new_token_result.status in [200, 201]
+
+- name: Fetch token details
+  ansible.builtin.uri:
+    url: "{{ palette_api_base }}/v1/edgehosts/tokens/{{ new_token_result.json.uid }}"
+    method: GET
+    headers: "{{ palette_auth_header }}"
+    return_content: true
+    status_code: [200]
+  register: token_details
+  retries: 5
+  delay: 3
+  until: token_details.status == 200
+
+- name: Set registration token facts
+  ansible.builtin.set_fact:
+    registration_token: "{{ token_details.json.spec.token }}"
+    registration_token_uid: "{{ new_token_result.json.uid }}"
+
+- name: Display registration token (masked)
+  ansible.builtin.debug:
+    msg: "Using registration token: {{ registration_token[:4] }}****{{ registration_token[-4:] }}"
+
+# --- Save generated secrets to local facts ---
+- name: Ensure local facts directory exists
+  ansible.builtin.file:
+    path: /etc/ansible/facts.d
+    state: directory
+    mode: "0755"
+  become: true
+
+- name: Write palette facts
+  ansible.builtin.copy:
+    content: |
+      {
+        "project_uid": "{{ palette_project_uid }}",
+        "project_name": "{{ palette_project_name }}",
+        "registration_token_uid": "{{ registration_token_uid }}"
+      }
+    dest: /etc/ansible/facts.d/palette.fact
+    mode: "0600"
+  become: true
+
+# --- Install and configure agent ---
+- name: Install required packages
+  ansible.builtin.package:
+    name:
+      - jq
+      - zstd
+      - rsync
+      - iptables
+    state: present
+  become: true
+  failed_when: false
+
+- name: Create spectro userdata directory
+  ansible.builtin.file:
+    path: /var/lib/spectro
+    state: directory
+    mode: "0755"
+  become: true
+
+- name: Write user-data configuration
+  ansible.builtin.copy:
+    content: |
+      #cloud-config
+      install:
+        reboot: false
+        poweroff: false
+      stylus:
+        vip:
+          skip: true
+        site:
+          edgeHostToken: {{ registration_token }}
+          paletteEndpoint: {{ palette_endpoint }}
+          projectName: {{ palette_project_name }}
+    dest: /var/lib/spectro/userdata
+    mode: "0600"
+  become: true
+
+- name: Detect architecture
+  ansible.builtin.set_fact:
+    agent_arch: "{{ 'arm64' if ansible_architecture == 'aarch64' else 'amd64' }}"
+
+- name: Download palette agent install script
+  ansible.builtin.get_url:
+    url: "https://github.com/spectrocloud/agent-mode/releases/latest/download/palette-agent-install.sh"
+    dest: /tmp/palette-agent-install.sh
+    mode: "0755"
+  become: true
+
+- name: Run palette agent install script
+  ansible.builtin.command:
+    cmd: /tmp/palette-agent-install.sh
+  environment:
+    TOKEN: "{{ registration_token }}"
+  become: true
+  register: install_result
+
+- name: Display install output
+  ansible.builtin.debug:
+    var: install_result.stdout_lines
+
+# --- Patch runtime userdata with token and correct endpoint ---
+- name: Ensure /run/stylus directory exists
+  ansible.builtin.file:
+    path: /run/stylus
+    state: directory
+    mode: "0755"
+  become: true
+
+- name: Read runtime userdata
+  ansible.builtin.slurp:
+    src: /run/stylus/userdata
+  register: runtime_userdata_raw
+  become: true
+  failed_when: false
+
+- name: Patch runtime userdata with registration token
+  ansible.builtin.copy:
+    content: |
+      {{ (runtime_userdata_raw.content | b64decode | regex_replace('paletteEndpoint:.*', 'paletteEndpoint: ' + palette_endpoint) | regex_replace('(site:\n)', 'site:\n    edgeHostToken: ' + registration_token + '\n    projectName: ' + palette_project_name + '\n')) if runtime_userdata_raw.content is defined else lookup('file', '/var/lib/spectro/userdata') }}
+    dest: /run/stylus/userdata
+    mode: "0600"
+  become: true
+  when: runtime_userdata_raw.content is defined
+
+- name: Copy userdata to runtime if no existing runtime config
+  ansible.builtin.copy:
+    src: /var/lib/spectro/userdata
+    dest: /run/stylus/userdata
+    mode: "0600"
+    remote_src: true
+  become: true
+  when: runtime_userdata_raw.content is not defined
+
+# --- Restart agent to pick up patched config ---
+- name: Restart stylus agent
+  ansible.builtin.systemd:
+    name: spectro-stylus-agent
+    state: restarted
+  become: true
+  failed_when: false
+
+- name: Wait for agent to register (up to 180s)
+  ansible.builtin.uri:
+    url: "{{ palette_api_base }}/v1/dashboard/edgehosts/search"
+    method: POST
+    headers: "{{ palette_auth_header | combine({'ProjectUid': palette_project_uid}) }}"
+    body_format: json
+    body:
+      filter:
+        conjunction: "and"
+        filterGroups: []
+      sort: []
+    return_content: true
+    status_code: [200]
+  register: registration_check
+  until: >
+    (registration_check.json['items'] | default([])
+     | selectattr('status.health.state', 'defined')
+     | selectattr('status.health.state', 'equalto', 'healthy')
+     | selectattr('metadata.name', 'match', 'edge-')
+     | list | length) > (existing_healthy_count | default(0) | int)
+  retries: 18
+  delay: 10
+
+- name: Read device ID from runtime userdata
+  ansible.builtin.shell: |
+    python3 -c "
+    import yaml
+    with open('/run/stylus/userdata') as f:
+        data = yaml.safe_load(f)
+    print(data.get('stylus',{}).get('site',{}).get('name',''))
+    "
+  register: new_device_id
+  changed_when: false
+  become: true
+
+- name: Find our edge host in results
+  ansible.builtin.set_fact:
+    registered_host: "{{ registration_check.json['items'] | selectattr('metadata.name', 'equalto', new_device_id.stdout) | list | first | default(None) }}"
+  when: new_device_id.stdout != ''
+
+- name: Display registration status
+  ansible.builtin.debug:
+    msg: "Edge host '{{ new_device_id.stdout }}' registered with UID: {{ registered_host.metadata.uid }} - health: {{ registered_host.status.health.state }}"
+  when: registered_host is defined and registered_host is not none
+
+- name: Update local facts with edge host UID
+  ansible.builtin.copy:
+    content: |
+      {
+        "project_uid": "{{ palette_project_uid }}",
+        "project_name": "{{ palette_project_name }}",
+        "registration_token_uid": "{{ registration_token_uid }}",
+        "edge_host_uid": "{{ registered_host.metadata.uid }}",
+        "edge_device_id": "{{ new_device_id.stdout }}"
+      }
+    dest: /etc/ansible/facts.d/palette.fact
+    mode: "0600"
+  become: true
+  when: registered_host is defined and registered_host is not none

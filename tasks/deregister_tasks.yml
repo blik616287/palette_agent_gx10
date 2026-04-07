@@ -1,0 +1,135 @@
+---
+# Deregister tasks - includable from site.yml or standalone deregister.yml
+- name: Gather facts for deregister
+  ansible.builtin.setup:
+
+- name: Set API vars for deregister
+  ansible.builtin.set_fact:
+    palette_api_base: "https://{{ palette_endpoint }}"
+    palette_auth_header:
+      ApiKey: "{{ palette_api_key }}"
+      Content-Type: "application/json"
+      Accept: "application/json"
+
+- name: Read device ID from runtime userdata
+  ansible.builtin.shell: |
+    if [ -f /run/stylus/userdata ]; then
+      python3 -c "
+    import yaml, sys
+    with open('/run/stylus/userdata') as f:
+        data = yaml.safe_load(f)
+    name = data.get('stylus',{}).get('site',{}).get('name','')
+    print(name)
+    "
+    fi
+  register: device_id_result
+  changed_when: false
+  become: true
+
+- name: Set device ID fact
+  ansible.builtin.set_fact:
+    palette_device_id: "{{ device_id_result.stdout | default('') }}"
+
+- name: Get project UID
+  ansible.builtin.uri:
+    url: "{{ palette_api_base }}/v1/dashboard/projects/metadata?name={{ palette_project_name | urlencode }}"
+    method: GET
+    headers: "{{ palette_auth_header }}"
+    return_content: true
+    status_code: [200]
+  register: project_lookup
+  retries: 3
+  delay: 2
+  until: project_lookup.status == 200
+
+- name: Set project UID fact
+  ansible.builtin.set_fact:
+    palette_project_uid: "{{ project_lookup.json['items'][0].metadata.uid }}"
+
+- name: Search for edge host by device ID
+  ansible.builtin.uri:
+    url: "{{ palette_api_base }}/v1/dashboard/edgehosts/search"
+    method: POST
+    headers: "{{ palette_auth_header | combine({'ProjectUid': palette_project_uid}) }}"
+    body_format: json
+    body:
+      filter:
+        conjunction: "and"
+        filterGroups:
+          - conjunction: "and"
+            filters:
+              - property: "name"
+                type: "string"
+                condition:
+                  string:
+                    operator: "eq"
+                    match:
+                      values:
+                        - "{{ palette_device_id }}"
+      sort: []
+    return_content: true
+    status_code: [200]
+  register: host_search
+  retries: 3
+  delay: 2
+  until: host_search.status == 200
+  when: palette_device_id != ''
+
+- name: Set edge host UID fact
+  ansible.builtin.set_fact:
+    edge_host_uid: "{{ host_search.json['items'][0].metadata.uid }}"
+  when: palette_device_id != '' and (host_search.json['items'] | default([])) | length > 0
+
+- name: Host not registered - skip deregistration
+  ansible.builtin.debug:
+    msg: "No edge host found for device '{{ palette_device_id | default('unknown') }}' in project {{ palette_project_name }}. Skipping deregistration."
+  when: edge_host_uid is not defined or edge_host_uid == ''
+
+# --- Delete from Palette API before stopping services ---
+- name: Delete edge host from Palette
+  ansible.builtin.uri:
+    url: "{{ palette_api_base }}/v1/edgehosts/{{ edge_host_uid }}"
+    method: DELETE
+    headers: "{{ palette_auth_header | combine({'ProjectUid': palette_project_uid}) }}"
+    status_code: [200, 204]
+  when: edge_host_uid is defined and edge_host_uid != ''
+  retries: 3
+  delay: 2
+
+- name: Deregistration complete
+  ansible.builtin.debug:
+    msg: "Edge host '{{ palette_device_id }}' ({{ edge_host_uid }}) deregistered."
+  when: edge_host_uid is defined and edge_host_uid != ''
+
+# --- Stop services ---
+- name: Stop spectro services
+  ansible.builtin.systemd:
+    name: "{{ item }}"
+    state: stopped
+    enabled: false
+  loop:
+    - spectro-stylus-agent
+    - spectro-stylus-operator
+    - spectro-palette-agent-reconcile.timer
+    - spectro-palette-agent-reconcile
+    - spectro-palette-agent-bootstrap
+    - spectro-palette-agent-network
+    - spectro-palette-agent-boot
+    - spectro-palette-agent-initramfs
+    - spectro-palette-agent-start
+    - spectro-palette-tui
+    - spectro-remote-shell
+  failed_when: false
+  become: true
+
+# --- Clean up local state ---
+- name: Remove local agent state
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  loop:
+    - /var/lib/spectro
+    - /run/stylus/userdata
+    - /oem/.spectrocloud/authToken
+  become: true
+  failed_when: false

@@ -1,0 +1,13 @@
+---
+# Combined play: deregister (if registered) then register
+- name: Deregister and Re-register Edge Host
+  hosts: edge_hosts
+  gather_facts: false
+  tasks:
+    - name: Run deregister playbook
+      ansible.builtin.include_tasks:
+        file: tasks/deregister_tasks.yml
+
+    - name: Run register playbook
+      ansible.builtin.include_tasks:
+        file: tasks/register_tasks.yml

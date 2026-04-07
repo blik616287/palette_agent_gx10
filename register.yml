@@ -1,0 +1,9 @@
+---
+# Register this edge host with Palette
+- name: Register Edge Host with Palette
+  hosts: edge_hosts
+  gather_facts: false
+  tasks:
+    - name: Run register tasks
+      ansible.builtin.include_tasks:
+        file: tasks/register_tasks.yml
