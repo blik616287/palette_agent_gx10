@@ -102,6 +102,10 @@
       - zstd
       - rsync
       - iptables
+      - conntrack
+      - socat
+      - ebtables
+      - ethtool
     state: present
   become: true
   failed_when: false
@@ -154,48 +158,80 @@
   ansible.builtin.debug:
     var: install_result.stdout_lines
 
-# --- Patch runtime userdata with token and correct endpoint ---
-- name: Ensure /run/stylus directory exists
-  ansible.builtin.file:
-    path: /run/stylus
-    state: directory
-    mode: "0755"
-  become: true
-
-- name: Read runtime userdata
-  ansible.builtin.slurp:
-    src: /run/stylus/userdata
-  register: runtime_userdata_raw
-  become: true
-  failed_when: false
-
-- name: Patch runtime userdata with registration token
+# --- Persistent cloud-config overlay ---
+# The running agent reads /oem/*.yaml at every boot and regenerates
+# /run/stylus/userdata from it. /var/lib/spectro/userdata only feeds the
+# one-shot installer; without a persistent overlay, the token is lost on
+# reboot and the agent loops with "EdgeHostToken is mandatory".
+- name: Write /oem/90_custom.yaml persistent overlay
   ansible.builtin.copy:
     content: |
-      {{ (runtime_userdata_raw.content | b64decode | regex_replace('paletteEndpoint:.*', 'paletteEndpoint: ' + palette_endpoint) | regex_replace('(site:\n)', 'site:\n    edgeHostToken: ' + registration_token + '\n    projectName: ' + palette_project_name + '\n')) if runtime_userdata_raw.content is defined else lookup('file', '/var/lib/spectro/userdata') }}
-    dest: /run/stylus/userdata
+      #cloud-config
+      stylus:
+        site:
+          edgeHostToken: {{ registration_token }}
+          paletteEndpoint: {{ palette_endpoint }}
+          projectName: {{ palette_project_name }}
+    dest: /oem/90_custom.yaml
     mode: "0600"
   become: true
-  when: runtime_userdata_raw.content is defined
 
-- name: Copy userdata to runtime if no existing runtime config
-  ansible.builtin.copy:
-    src: /var/lib/spectro/userdata
-    dest: /run/stylus/userdata
-    mode: "0600"
-    remote_src: true
+# --- Branch: agent already running (post-reboot re-run) vs. first install ---
+- name: Check whether agent runtime userdata exists
+  ansible.builtin.stat:
+    path: /run/stylus/userdata
+  register: stylus_runtime
   become: true
-  when: runtime_userdata_raw.content is not defined
 
-# --- Restart agent to pick up patched config ---
-- name: Restart stylus agent
+- name: Reboot required notice
+  ansible.builtin.debug:
+    msg: |
+      Palette agent installed. REBOOT required to start the agent pipeline
+      (spectro-palette-agent-initramfs.service is wired to sysinit.target and
+      only fires at boot). After reboot, the agent reads /oem/90_custom.yaml
+      and registers automatically. Re-run this playbook post-reboot to verify
+      and capture the edge-host UID into local facts.
+  when: not stylus_runtime.stat.exists
+
+- name: Patch runtime userdata with token (already-running agent)
+  ansible.builtin.shell: |
+    python3 <<'PY'
+    import yaml
+    path = '/run/stylus/userdata'
+    with open(path) as f:
+        data = yaml.safe_load(f) or {}
+    site = data.setdefault('stylus', {}).setdefault('site', {})
+    site['edgeHostToken'] = '{{ registration_token }}'
+    site['paletteEndpoint'] = '{{ palette_endpoint }}'
+    site['projectName'] = '{{ palette_project_name }}'
+    with open(path, 'w') as f:
+        f.write('#cloud-config\n')
+        yaml.safe_dump(data, f, default_flow_style=False, sort_keys=False)
+    PY
+  become: true
+  when: stylus_runtime.stat.exists
+
+- name: Restart stylus agent to pick up patched config
   ansible.builtin.systemd:
     name: spectro-stylus-agent
     state: restarted
   become: true
-  failed_when: false
+  when: stylus_runtime.stat.exists
 
-- name: Wait for agent to register (up to 180s)
+- name: Read device ID from runtime userdata
+  ansible.builtin.shell: |
+    python3 -c "
+    import yaml
+    with open('/run/stylus/userdata') as f:
+        data = yaml.safe_load(f) or {}
+    print(data.get('stylus',{}).get('site',{}).get('name',''))
+    "
+  register: new_device_id
+  changed_when: false
+  become: true
+  when: stylus_runtime.stat.exists
+
+- name: Wait for this edge host to appear healthy in Palette
   ansible.builtin.uri:
     url: "{{ palette_api_base }}/v1/dashboard/edgehosts/search"
     method: POST
@@ -204,7 +240,17 @@
     body:
       filter:
         conjunction: "and"
-        filterGroups: []
+        filterGroups:
+          - conjunction: "and"
+            filters:
+              - property: "name"
+                type: "string"
+                condition:
+                  string:
+                    operator: "eq"
+                    match:
+                      values:
+                        - "{{ new_device_id.stdout }}"
       sort: []
     return_content: true
     status_code: [200]
@@ -213,32 +259,23 @@
     (registration_check.json['items'] | default([])
      | selectattr('status.health.state', 'defined')
      | selectattr('status.health.state', 'equalto', 'healthy')
-     | selectattr('metadata.name', 'match', 'edge-')
-     | list | length) > (existing_healthy_count | default(0) | int)
-  retries: 18
+     | list | length) > 0
+  retries: 24
   delay: 10
+  when: stylus_runtime.stat.exists and new_device_id.stdout != ''
 
-- name: Read device ID from runtime userdata
-  ansible.builtin.shell: |
-    python3 -c "
-    import yaml
-    with open('/run/stylus/userdata') as f:
-        data = yaml.safe_load(f)
-    print(data.get('stylus',{}).get('site',{}).get('name',''))
-    "
-  register: new_device_id
-  changed_when: false
-  become: true
-
-- name: Find our edge host in results
+- name: Capture registered edge host
   ansible.builtin.set_fact:
-    registered_host: "{{ registration_check.json['items'] | selectattr('metadata.name', 'equalto', new_device_id.stdout) | list | first | default(None) }}"
-  when: new_device_id.stdout != ''
+    registered_host: "{{ registration_check.json['items'] | first }}"
+  when:
+    - stylus_runtime.stat.exists
+    - registration_check is defined
+    - (registration_check.json['items'] | default([])) | length > 0
 
 - name: Display registration status
   ansible.builtin.debug:
     msg: "Edge host '{{ new_device_id.stdout }}' registered with UID: {{ registered_host.metadata.uid }} - health: {{ registered_host.status.health.state }}"
-  when: registered_host is defined and registered_host is not none
+  when: registered_host is defined
 
 - name: Update local facts with edge host UID
   ansible.builtin.copy:
@@ -253,4 +290,4 @@
     dest: /etc/ansible/facts.d/palette.fact
     mode: "0600"
   become: true
-  when: registered_host is defined and registered_host is not none
+  when: registered_host is defined
